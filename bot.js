@@ -15,10 +15,40 @@ const MAX_SIZE_MB = 14.5;
 
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
-// Store conversation state per user: { url, startSec }
 const userState = {};
 
 console.log('🤖 Telegram bot started!');
+
+// ── Try multiple download strategies ─────────────────────────────────────────
+
+async function downloadAudio(url, rawPath) {
+    const strategies = [
+        // Strategy 1: Android client (most reliable on cloud IPs)
+        `yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 --extractor-args "youtube:player_client=android" -o "${rawPath}" "${url}"`,
+        // Strategy 2: iOS client
+        `yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 --extractor-args "youtube:player_client=ios" -o "${rawPath}" "${url}"`,
+        // Strategy 3: TV client (no bot detection)
+        `yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 --extractor-args "youtube:player_client=tv" -o "${rawPath}" "${url}"`,
+        // Strategy 4: mweb client
+        `yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 --extractor-args "youtube:player_client=mweb" -o "${rawPath}" "${url}"`,
+    ];
+
+    for (const cmd of strategies) {
+        try {
+            console.log(`Trying: ${cmd.split('player_client=')[1]?.split('"')[0] || 'default'}`);
+            await execAsync(cmd, { timeout: 300000 });
+            if (fs.existsSync(rawPath)) {
+                console.log('✅ Download succeeded!');
+                return;
+            }
+        } catch (err) {
+            console.log(`❌ Strategy failed: ${err.message.substring(0, 100)}`);
+            try { fs.unlinkSync(rawPath); } catch (_) {}
+            continue;
+        }
+    }
+    throw new Error('All download strategies failed. YouTube is blocking this server.');
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -40,21 +70,13 @@ function secondsToDisplay(sec) {
 }
 
 function extractYouTubeUrl(text) {
-    // Handles: youtu.be, youtube.com/watch, youtube.com/live, youtube.com/shorts
     const match = text.match(/(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?[^\s]*v=|live\/|shorts\/)|youtu\.be\/)([\w-]+)(?:[^\s]*)?/);
     return match ? match[0] : null;
 }
 
 function extractTime(text) {
-    // Extract first time pattern from a line: dots or colons
     const match = text.match(/\d{1,2}[.:]\d{2}(?:[.:]\d{2})?/);
     return match ? match[0] : null;
-}
-
-function isTimeOnly(text) {
-    // True if the message is just a timestamp (possibly with "To" prefix)
-    const cleaned = text.trim().replace(/^to\s*/i, '');
-    return /^\d{1,2}[.:]\d{2}(?:[.:]\d{2})?$/.test(cleaned);
 }
 
 // ── Compression ───────────────────────────────────────────────────────────────
@@ -77,7 +99,7 @@ async function compressAudio(inputPath, startSec, duration, outputPath) {
     return finalSize;
 }
 
-// ── Process and send clip ─────────────────────────────────────────────────────
+// ── Process and send ──────────────────────────────────────────────────────────
 
 async function processAndSend(chatId, url, startSec, endSec) {
     const duration = endSec - startSec;
@@ -88,8 +110,7 @@ async function processAndSend(chatId, url, startSec, endSec) {
     const statusMsg = await bot.sendMessage(chatId, '⏳ Downloading audio...');
 
     try {
-        await execAsync(`yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 --extractor-args "youtube:player_client=ios" -o "${rawPath}" "${url}"`, { timeout: 300000 });
-        if (!fs.existsSync(rawPath)) throw new Error('Download failed.');
+        await downloadAudio(url, rawPath);
 
         await bot.editMessageText('✂️ Trimming and compressing...', { chat_id: chatId, message_id: statusMsg.message_id });
 
@@ -112,9 +133,9 @@ async function processAndSend(chatId, url, startSec, endSec) {
         try { fs.unlinkSync(outPath); } catch (_) {}
 
         let userMsg = '❌ Something went wrong. Please try again.';
-        if (err.message.includes('Sign in to confirm')) userMsg = '❌ YouTube blocked the download. Try again in a few minutes.';
+        if (err.message.includes('blocking')) userMsg = '❌ YouTube is blocking this server. Please try again in a few minutes.';
         else if (err.message.includes('Video unavailable')) userMsg = '❌ This video is unavailable or private.';
-        else if (err.message.includes('too long')) userMsg = '❌ Clip too long to compress under 15MB. Try a shorter range.';
+        else if (err.message.includes('too long')) userMsg = '❌ Clip too long — try a shorter range.';
 
         await bot.editMessageText(userMsg, { chat_id: chatId, message_id: statusMsg.message_id }).catch(() =>
             bot.sendMessage(chatId, userMsg)
@@ -127,21 +148,12 @@ async function processAndSend(chatId, url, startSec, endSec) {
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     const text = (msg.text || msg.caption || '').trim();
-
     if (!text) return;
 
-    // Help
     if (text === '/start' || text === '/help') {
         userState[chatId] = null;
         return bot.sendMessage(chatId,
-            '🎵 *YT Audio Cutter*\n\n' +
-            'Send me messages one by one:\n\n' +
-            '*1.* YouTube link\n' +
-            '*2.* Start time (e.g. `29.25`)\n' +
-            '*3.* End time (e.g. `1.12.03`)\n\n' +
-            'Or send them all in one message:\n' +
-            '`https://youtu.be/xxxx\n29.25\nTo\n1.12.03`\n\n' +
-            'Type /cancel to start over.',
+            '🎵 *YT Audio Cutter*\n\nSend messages one by one:\n\n*1.* YouTube link\n*2.* Start time (e.g. `29.25`)\n*3.* End time (e.g. `1.12.03`)\n\nType /cancel to start over.',
             { parse_mode: 'Markdown' }
         );
     }
@@ -152,14 +164,11 @@ bot.on('message', async (msg) => {
     }
 
     const state = userState[chatId] || {};
-
-    // ── Step 1: Check if this message contains a full request ─────────────────
     const url = extractYouTubeUrl(text);
-    const timePattern = /\d{1,2}[.:]\d{2}(?:[.:]\d{2})?/g;
-    const allTimes = [...text.matchAll(timePattern)];
+    const allTimes = [...text.matchAll(/\d{1,2}[.:]\d{2}(?:[.:]\d{2})?/g)];
 
+    // Full message with everything
     if (url && allTimes.length >= 2) {
-        // Full message with URL + 2 times — process immediately
         const startSec = parseTime(allTimes[0][0]);
         const endSec = parseTime(allTimes[allTimes.length - 1][0]);
         if (startSec !== null && endSec !== null && endSec > startSec) {
@@ -168,45 +177,38 @@ bot.on('message', async (msg) => {
         }
     }
 
-    // ── Step 2: Stateful flow — collect URL, start, end separately ────────────
-
-    // If message has a YouTube URL → save it, ask for start time
+    // URL only → ask for start time
     if (url) {
         userState[chatId] = { url };
         return bot.sendMessage(chatId, '✅ Got the link! Now send the *start time*:', { parse_mode: 'Markdown' });
     }
 
-    // If we have a URL saved and this looks like a time
+    // Have URL, waiting for times
     if (state.url) {
         const timeStr = extractTime(text.replace(/^to\s*/i, ''));
         const timeSec = parseTime(timeStr);
 
         if (timeSec === null) {
-            return bot.sendMessage(chatId, '⚠️ That doesn\'t look like a time. Send something like `29.25` or `1.12.03`', { parse_mode: 'Markdown' });
+            return bot.sendMessage(chatId, '⚠️ Send a time like `29.25` or `1.12.03`', { parse_mode: 'Markdown' });
         }
 
-        if (!state.startSec && state.startSec !== 0) {
-            // Save start time, ask for end
+        if (state.startSec === undefined) {
             userState[chatId] = { url: state.url, startSec: timeSec };
             return bot.sendMessage(chatId, `✅ Start: *${secondsToDisplay(timeSec)}* — now send the *end time*:`, { parse_mode: 'Markdown' });
         } else {
-            // Have start — this is the end time
-            const endSec = timeSec;
-            if (endSec <= state.startSec) {
+            if (timeSec <= state.startSec) {
                 return bot.sendMessage(chatId, '⚠️ End time must be after start time. Send the end time again:');
             }
             userState[chatId] = null;
-            return processAndSend(chatId, state.url, state.startSec, endSec);
+            return processAndSend(chatId, state.url, state.startSec, timeSec);
         }
     }
 
-    // No context — prompt them
     bot.sendMessage(chatId, 'Send me a YouTube link to get started. Type /help for instructions.');
 });
 
 bot.on('polling_error', (err) => console.error('Polling error:', err.message));
 
-// Keep-alive for Render
 const http = require('http');
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => res.end('OK')).listen(PORT, () => {
