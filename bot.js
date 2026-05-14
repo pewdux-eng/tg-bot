@@ -88,7 +88,7 @@ async function processAndSend(chatId, url, startSec, endSec) {
     const statusMsg = await bot.sendMessage(chatId, '⏳ Downloading audio...');
 
     try {
-        await execAsync(`yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 -o "${rawPath}" "${url}"`, { timeout: 300000 });
+        await execAsync(`yt-dlp -x --audio-format mp3 -f bestaudio --audio-quality 0 --extractor-args "youtube:player_client=ios" -o "${rawPath}" "${url}"`, { timeout: 300000 });
         if (!fs.existsSync(rawPath)) throw new Error('Download failed.');
 
         await bot.editMessageText('✂️ Trimming and compressing...', { chat_id: chatId, message_id: statusMsg.message_id });
